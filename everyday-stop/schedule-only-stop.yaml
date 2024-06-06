@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Stop EC2 and RDS every day
+
+Parameters: 
+  ExcludeRdsClusterNameList:
+    Description: "RDS cluster name list (separate by ',')"
+    Type: String
+  ExcludeEC2InstanceIdList:
+    Description: "EC2 instance id list (separate by ',')"
+    Type: String
+
+Resources: 
+  LambdaRoleSchedule:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: PolicySchedule
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "rds:StopDBInstance"
+            - "rds:StopDBCluster"
+            - "rds:DescribeDBClusters"
+            - "rds:DescribeDBInstances"
+            - "autoscaling:DescribeAutoScalingInstances"
+            - "autoscaling:PutScheduledUpdateGroupAction"
+            - "ec2:StopInstances"
+            - "ec2:DescribeInstances"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: "*"
+
+  StopServiceLambda: 
+    Type: "AWS::Lambda::Function"
+    Properties: 
+      Handler: "index.handler"
+      Timeout: 30
+      Role: 
+        Fn::GetAtt: 
+          - "LambdaRoleSchedule"
+          - "Arn"
+      Runtime: "python3.7"
+      Environment:
+        Variables:
+          rds_exclude_cluster_list: !Ref ExcludeRdsClusterNameList
+          ec2_exclude_instance_id_list: !Ref ExcludeEC2InstanceIdList
+      Code: 
+        ZipFile: |
+          import botocore
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          rds_exclude_list = os.environ["rds_exclude_cluster_list"].split(",")
+          ec2_exclude_list = os.environ["ec2_exclude_instance_id_list"].split(",")
+
+          def handler(event, context):
+            rdsclient = boto3.client('rds')
+            response = rdsclient.describe_db_instances()
+            logger.info(dict(response))
+            for instance in response.get('DBInstances'):
+                instanceId = instance.get('DBInstanceIdentifier')
+                if instanceId in rds_exclude_list:
+                    continue
+                try:
+                    res = rdsclient.stop_db_instance(DBInstanceIdentifier=instanceId)
+                    logger.info(res)
+                    
+                except botocore.exceptions.ClientError as error:
+                    logger.error(error.response['Error'])
+                    # if error.response['Error']['Code'] != 'InvalidDBInstanceStateFault':
+                    #     # 既に停止済の場合は'InvalidDBInstanceStateFault'となるので、それ以外の場合はraiseする
+                    #     raise error
+                        
+            cluster_res = rdsclient.describe_db_clusters()
+            logger.info(dict(cluster_res))
+            for cluster in cluster_res.get('DBClusters'):
+                clusterId = cluster.get('DBClusterIdentifier')
+                if clusterId in rds_exclude_list:
+                    continue
+                try:
+                    res = rdsclient.stop_db_cluster(DBClusterIdentifier=clusterId)
+                    logger.info(res)
+                    
+                except botocore.exceptions.ClientError as error:
+                    logger.error(error.response['Error'])
+                    # if error.response['Error']['Code'] != 'InvalidDBClusterStateFault':
+                    #     # 既に停止済の場合は'InvalidDBClusterStateFault'となるので、それ以外の場合はraiseする
+                    #     raise error
+              
+                        
+            ec2 = boto3.client('ec2')
+            ec2_data = ec2.describe_instances()
+            instanceIds = []
+            for ec2_reservation in ec2_data['Reservations']:
+                for ec2_instance in ec2_reservation['Instances']:
+                    id = ec2_instance['InstanceId']
+                    if id in ec2_exclude_list:
+                        continue
+                    instanceIds.append(id)
+                    ec2_instance_type = ec2_instance['InstanceType']
+                    ec2_instance_state = ec2_instance['State']['Name']
+                    
+                    print(id + ',' + ec2_instance_type + ',' + ec2_instance_state)
+            
+            ec2.stop_instances(InstanceIds=instanceIds)
+
+            autoscaling = boto3.client('autoscaling')
+            autoscaling_instances = autoscaling.describe_auto_scaling_instances()
+            logger.info(autoscaling_instances)
+            for autoscaling_instance in autoscaling_instances['AutoScalingInstances']:
+                id = autoscaling_instance['InstanceId']
+                if id in ec2_exclude_list:
+                    continue
+                autoscaling_name = autoscaling_instance['AutoScalingGroupName']
+                autoscaling.put_scheduled_update_group_action(
+                    AutoScalingGroupName=autoscaling_name,
+                    ScheduledActionName='stop',
+                    Recurrence='0 21 * * 1-5',
+                    MinSize=0,
+                    MaxSize=0,
+                    DesiredCapacity=0,
+                    TimeZone='Japan'
+                )
+
+  StopScheduleEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ’Stop schedule event for lambda’
+      ScheduleExpression: 'cron(0 12 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StopServiceLambda.Arn
+          Id: ScheduleEvent1Target
+    DependsOn:
+      - StopServiceLambda
+
+  StopLambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt StopServiceLambda.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt StopScheduleEvent.Arn
+

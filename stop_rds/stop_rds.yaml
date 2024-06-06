@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Ability to automatically start and stop RDS
+
+Parameters: 
+  RdsClusterNameList:
+    Description: "RDS cluster name list (separate by ',')"
+    Type: String
+
+Resources: 
+  LambdaRoleStopRDS:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: PolicyStopRDS
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "rds:StopDBCluster"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: "*"
+
+  StopRDSLambda: 
+    Type: "AWS::Lambda::Function"
+    Properties: 
+      Handler: "index.handler"
+      Timeout: 30
+      Role: 
+        Fn::GetAtt: 
+          - "LambdaRoleStopRDS"
+          - "Arn"
+      Environment:
+        Variables:
+          cluster_list: !Ref RdsClusterNameList
+      Runtime: "python3.7"
+      Code: 
+        ZipFile: |
+          import botocore
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          cluster_list = os.environ["cluster_list"].split(",")
+          
+          def handler(event, context):
+              rds = boto3.client('rds')
+              
+              for cluster in cluster_list:
+                  logger.info(cluster)
+                  
+                  try:
+                      res = rds.stop_db_cluster(DBClusterIdentifier=cluster)
+                      logger.info(res)
+                      
+                  except botocore.exceptions.ClientError as error:
+                      if error.response['Error']['Code'] != 'InvalidDBClusterStateFault':
+                          # 既に停止済の場合は'InvalidDBClusterStateFault'となるので、それ以外の場合はraiseする
+                          raise error
+
+  StopRDSScheduleEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ’StopRDS schedule event for lambda’
+      ScheduleExpression: 'cron(0 * * * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StopRDSLambda.Arn
+          Id: ScheduleEvent1Target
+    DependsOn:
+      - StopRDSLambda
+
+  LambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt StopRDSLambda.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt StopRDSScheduleEvent.Arn
+
