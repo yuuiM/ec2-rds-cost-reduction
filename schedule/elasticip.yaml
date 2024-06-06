@@ -1,0 +1,104 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Associate ElasticIP to EC2
+
+
+Parameters: 
+  AutoScalingLogicalId:
+    Description: "Associate auto scaling logical-id"
+    Type: String
+  EipAllocationId:
+    Description: "ElasticIP allocation(wariate) id. example: eipalloc-0932e7023e40dd917"
+    Type: String
+
+Resources: 
+  LambdaRoleSchedule:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: PolicyEniAssociate
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - "ec2:DescribeInstances"
+            - "ec2:AssociateAddress"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: "*"
+
+  ENIAssociateLambda: 
+    Type: "AWS::Lambda::Function"
+    Properties: 
+      Handler: "index.handler"
+      Timeout: 30
+      Role: 
+        Fn::GetAtt: 
+          - "LambdaRoleSchedule"
+          - "Arn"
+      Runtime: "python3.7"
+      Environment:
+        Variables:
+          AutoScalingName: !Ref AutoScalingLogicalId
+          EipAllocationId: !Ref EipAllocationId
+      Code: 
+        ZipFile: |
+          import botocore
+          import boto3
+          import logging
+          import os
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          AutoScalingName = os.environ["AutoScalingName"]
+          EipAllocationId = os.environ["EipAllocationId"]
+
+          def handler(event, context):                        
+            ec2 = boto3.client('ec2')
+            ec2_data = ec2.describe_instances()
+            instanceIds = []
+            for ec2_reservation in ec2_data['Reservations']:
+              for ec2_instance in ec2_reservation['Instances']:
+                logger.info(ec2_instance)
+                for tag in ec2_instance['Tags']:
+                  logger.info(tag)
+                  if tag['Value'] in AutoScalingName:
+                    associate = ec2.associate_address(AllocationId=EipAllocationId,InstanceId=ec2_instance["InstanceId"]) #EIP関連付け
+                    break
+
+
+  ENIAssociateEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ’Stop schedule event for lambda’
+      ScheduleExpression: 'cron(10 0 ? * MON-FRI *)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ENIAssociateLambda.Arn
+          Id: ENIAssociateLEvent1Target
+    DependsOn:
+      - ENIAssociateLambda
+
+  ENIAssociateLambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt ENIAssociateLambda.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ENIAssociateEvent.Arn
+
